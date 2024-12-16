@@ -1,62 +1,88 @@
 using Flux
-using ReverseDiff
+using Zygote
 using BSON
 using CSV
 using DataFrames
 using Statistics
 using Random: randn
+using Plots
+using LinearAlgebra
+using Dates
 
-println("Starting Functional Neural SDE with ReverseDiff (no Float32 casts during forward pass)...")
+function log(message::String)
+    Zygote.ignore() do
+        timestamp = Dates.format(now(), "yyyy-mm-dd HH:MM:SS.sss")
+        println("[$timestamp] $message")
+    end
+end
+
+log("Starting Functional Neural SDE with Zygote...")
 
 # Load and Preprocess Dataset
 file_path = "options-A-merged.csv"
-println("Loading dataset from '$file_path'...")
+log("Loading dataset from '$file_path'...")
 dataset = CSV.File(file_path, header=true) |> DataFrame
-println("Dataset loaded successfully!")
-
-num_rows, num_cols = size(dataset)
-println("Rows and columns in dataset: $num_rows, $num_cols")
+log("Dataset loaded successfully!")
 
 function preprocess_data(dataset, train_ratio=0.8)
     CLOSE = Float32.(dataset.CLOSE)
     delta = Float32.(dataset.delta)
+    gamma = Float32.(dataset.gamma)
+    theta = Float32.(dataset.theta)
+    vega = Float32.(dataset.vega)
+    rho = Float32.(dataset.rho)
+    bid = Float32.(dataset.bid)
+    ask = Float32.(dataset.ask)
+    strike_normalized = Float32.(dataset.strike ./ dataset.CLOSE)
+    call_put_binary = Float32.((dataset.call_put .== "Call") .* 1 .+ (dataset.call_put .!= "Call") .* -1)
+
+    midpoint = Float32.((bid + ask) ./ 2)
+    T = Float32.(Dates.value.(dataset.expiration .- dataset.date)) ./ 365.0
+
+    features = hcat(
+        CLOSE,
+        delta,
+        gamma,
+        theta,
+        vega,
+        rho,
+        T,
+        strike_normalized,
+        midpoint,
+        call_put_binary
+    )
+
+    feature_mean = mean(features, dims=1)
+    feature_std = std(features, dims=1)
+    normalized_features = (features .- feature_mean) ./ feature_std
+    normalized_features = clamp.(normalized_features, -3.0f0, 3.0f0)
 
     num_train = Int(size(dataset, 1) * train_ratio)
-    S_train = CLOSE[1:num_train]
-    V_train = delta[1:num_train]
+    x_train = normalized_features[1:num_train, :]
+    y_train = normalized_features[1:num_train, 1:2]
+    x_test = normalized_features[num_train+1:end, :]
+    y_test = normalized_features[num_train+1:end, 1:2]
 
-    max_S = maximum(S_train)
-    max_V = maximum(V_train)
-    if max_S == 0.0f0 || max_V == 0.0f0
-        error("Max in 'CLOSE' or 'delta' is zero, normalization not possible.")
-    end
-
-    S_train_scaled = S_train ./ max_S
-    V_train_scaled = V_train ./ max_V
-    return S_train_scaled, V_train_scaled, max_S, max_V
+    return Float32.(x_train), Float32.(y_train), Float32.(x_test), Float32.(y_test), feature_mean, feature_std
 end
 
-S_train_scaled, V_train_scaled, max_S, max_V = preprocess_data(dataset)
-u0 = [S_train_scaled[1], V_train_scaled[1]]  # Both Float32
+x_train, y_train, x_test, y_test, feature_mean, feature_std = preprocess_data(dataset)
+log("Preprocessed dataset.")
 
-num_train_samples = length(S_train_scaled)
-t_train = collect(Float32, 0.0f0:1.0f0/(num_train_samples - 1):1.0f0)
-dt = t_train[2] - t_train[1]
+# Xavier initialization
+function xavier_initialization(layers)
+    θ_vals = []
+    for (in_dim, out_dim) in layers
+        W = Float32.(randn(out_dim, in_dim) .* sqrt(2.0 / (in_dim + out_dim)))
+        b = Float32.(zeros(out_dim))
+        push!(θ_vals, vec(W), b)
+    end
+    return reduce(vcat, θ_vals)
+end
 
-# Neural network architecture parameters
-# Each network: Dense(2->16, relu), Dense(16->16, relu), Dense(16->2)
-# Params count per network: 354
-# For two networks (drift & diffusion): 708 params total
-const DRIFT_PARAMS = 354
-const TOTAL_PARAMS = 708
+drift_layers = [(10, 32), (32, 32), (32, 2)]
+diffusion_layers = [(10, 32), (32, 32), (32, 2)]
 
-# Fixed correlation parameter
-ρ = -0.7f0
-
-# Initialize parameters θ_vec
-θ_vec = Float32.(randn(TOTAL_PARAMS)*0.01)
-
-# Helper to build Dense layers from a parameter vector
 function build_dense(θ_val, idx, in_dim, out_dim, σ=relu)
     W_size = out_dim * in_dim
     W = reshape(θ_val[idx:idx+W_size-1], out_dim, in_dim)
@@ -68,101 +94,85 @@ end
 
 function build_chain(θ_val)
     idx = 1
-    l1, idx = build_dense(θ_val, idx, 2, 16, relu)
-    l2, idx = build_dense(θ_val, idx, 16, 16, relu)
-    l3, idx = build_dense(θ_val, idx, 16, 2, identity)
+    l1, idx = build_dense(θ_val, idx, 10, 32, leakyrelu)
+    l2, idx = build_dense(θ_val, idx, 32, 32, leakyrelu)
+    l3, idx = build_dense(θ_val, idx, 32, 2, identity)
     Chain(l1, l2, l3)
 end
 
 function build_models(θ)
-    # Extract the raw values from θ (if tracked, this creates a dependency ReverseDiff can follow)
-    θ_val = ReverseDiff.value.(θ)
+    drift_param_count = sum([in_dim * out_dim + out_dim for (in_dim, out_dim) in drift_layers])
+    diff_param_count = sum([in_dim * out_dim + out_dim for (in_dim, out_dim) in diffusion_layers])
 
-    drift_params = θ_val[1:DRIFT_PARAMS]
-    diff_params = θ_val[DRIFT_PARAMS+1:end]
+    drift_params = θ[1:drift_param_count]
+    diff_params = θ[drift_param_count+1:end]
 
     nn_drift_built = build_chain(drift_params)
     nn_diffusion_built = build_chain(diff_params)
     return nn_drift_built, nn_diffusion_built
 end
 
-function forward_sde(u0, θ; dt=dt)
+function forward_batch(x, θ; dt=1.0f0 / size(x, 1))
     nn_drift_built, nn_diffusion_built = build_models(θ)
+    num_samples = size(x, 1)
 
-    # Store states in Vector{Any} so we can insert tracked values
-    S_values = Any[u0[1]]
-    V_values = Any[u0[2]]
+    dW1_values = sqrt(dt) .* randn(Float32, num_samples)
+    dZ_values = sqrt(dt) .* randn(Float32, num_samples)
+    dW2_values = -0.7f0 .* dW1_values .+ sqrt(1 - (-0.7f0)^2) .* dZ_values
 
-    for i in 2:length(S_train_scaled)
-        S_prev = S_values[end]
-        V_prev = V_values[end]
-        
-        # Just use the values as is. They are Float32 or tracked Float32, no need to cast.
-        state_input = [S_prev, V_prev]  # Vector of length 2
-
-        f = nn_drift_built(state_input)
+    S_values = map(i -> begin
+        f = nn_drift_built(x[i, :])
+        g = nn_diffusion_built(x[i, :])
         fS, fV = f[1], f[2]
-
-        g = nn_diffusion_built(state_input)
         gS, gV = g[1], g[2]
+        V_next = max(0.0f0, fV * dt + gV * dW2_values[i])
+        S_next = fS * dt + sqrt(max(0.0f0, V_next)) * gS * dW1_values[i]
+        (S_next, V_next)
+    end, 1:num_samples)
 
-        dW1 = sqrt(dt)*randn(Float32)
-        dZ  = sqrt(dt)*randn(Float32)
-        dW2 = ρ * dW1 + sqrt(1 - ρ^2)*dZ
-
-        S_next = S_prev + fS*dt + gS*dW1
-        V_next = V_prev + fV*dt + gV*dW2
-
-        # Append next states
-        push!(S_values, S_next)
-        push!(V_values, V_next)
-    end
-    return S_values, V_values
+    return map(first, S_values), map(last, S_values)
 end
 
-function loss(θ)
-    S_pred, V_pred = forward_sde(u0, θ)
-    # S_pred, V_pred may contain tracked values. Arithmetic with Float32 arrays is fine.
-    # mean and arithmetic should be differentiable by ReverseDiff.
-    mse_S = mean((S_pred .- S_train_scaled).^2)
-    mse_V = mean((V_pred .- V_train_scaled).^2)
-    mse_S + mse_V
+function calculate_loss(x, y, θ)
+    S_pred, V_pred = forward_batch(x, θ)
+    mse_S = mean((S_pred .- y[:, 1]).^2)
+    mse_V = mean((V_pred .- y[:, 2]).^2)
+    return mse_S + mse_V
 end
 
-function train(epochs, lr, θ_vec)
-    println("Starting training process...")
-    losses = Float32[]
+function train_model(x_train, y_train, x_test, y_test, θ, epochs, lr)
+    log("Starting training...")
+    train_loss_history = []
+    val_loss_history = []
 
     for epoch in 1:epochs
-        grad_θ = ReverseDiff.gradient(loss, θ_vec)
-        θ_vec = θ_vec .- lr .* grad_θ
+        function compute_loss(θ)
+            return calculate_loss(x_train, y_train, θ) + 1e-4 * sum(θ.^2)
+        end
 
-        current_loss = loss(θ_vec)
-        push!(losses, current_loss)
-        println("Epoch $epoch completed. Loss: $current_loss")
+        train_loss, pullback_fn = Zygote.pullback(compute_loss, θ)
+        grad = pullback_fn(1)[1]
+        clipped_grad = clamp.(grad, -10.0f0, 10.0f0)
+        θ .= θ .- lr .* clipped_grad
+
+        push!(train_loss_history, train_loss)
+        val_loss = calculate_loss(x_test, y_test, θ)
+        push!(val_loss_history, val_loss)
+
+        log("Epoch $epoch: Training Loss = $train_loss, Validation Loss = $val_loss")
     end
 
-    BSON.@save "neural_sde_model.bson" θ_vec ρ
-    println("Model parameters saved to neural_sde_model.bson")
-    return θ_vec, losses
+    BSON.@save "neural_sde_model_nobatches.bson" θ=θ train_loss_history=train_loss_history val_loss_history=val_loss_history
+    log("Model saved.")
+    return train_loss_history, val_loss_history
 end
 
-# Example training run
-lr = 0.001f0
-θ_vec, losses = train(10, lr, θ_vec)
+θ_vec = xavier_initialization(drift_layers) + xavier_initialization(diffusion_layers)
+epochs = 10
+lr = 0.01f0
+train_loss_history, val_loss_history = train_model(x_train, y_train, x_test, y_test, θ_vec, epochs, lr)
 
-function load_model(save_path="neural_sde_model.bson")
-    println("Loading model from $save_path...")
-    model_data = BSON.load(save_path)
-    θ_loaded = model_data[:θ_vec]
-    ρ_loaded = model_data[:ρ]
-    println("Model loaded successfully!")
-    return θ_loaded, ρ_loaded
-end
-
-θ_loaded, ρ_loaded = load_model()
-
-println("Testing loaded model with final parameters...")
-S_pred, V_pred = forward_sde(u0, θ_loaded)
-@show mean((S_pred .- S_train_scaled).^2)
-@show mean((V_pred .- V_train_scaled).^2)
+# Plot loss history
+log("Plotting loss history...")
+plot(1:epochs, train_loss_history, label="Training Loss", xlabel="Epoch", ylabel="Loss", title="Loss History")
+plot!(1:epochs, val_loss_history, label="Validation Loss", xlabel="Epoch", ylabel="Loss", title="Loss History")
