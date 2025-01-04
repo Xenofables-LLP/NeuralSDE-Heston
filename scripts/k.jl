@@ -28,12 +28,27 @@ log("Dataset loaded successfully!")
 num_rows, num_cols = size(dataset)
 log("Rows and columns in dataset: $num_rows, $num_cols")
 
+# Normalization function
+function normalize_column(data, method="zscore")
+    if method == "zscore"
+        mean_val = mean(data)
+        std_val = std(data)
+        return (data .- mean_val) ./ std_val, mean_val, std_val
+    elseif method == "minmax"
+        min_val = minimum(data)
+        max_val = maximum(data)
+        return (data .- min_val) ./ (max_val - min_val), min_val, max_val
+    else
+        error("Invalid normalization method.")
+    end
+end
+
 # Preprocess the dataset
 function preprocess_data(dataset, train_ratio=0.8)
     log("Dataset column names: $(names(dataset))")
     log("Dataset CLOSE stats: mean = $(mean(dataset.CLOSE)), std = $(std(dataset.CLOSE))")
 
-    # Extract features and normalize
+    # Extract features
     CLOSE = Float32.(dataset.CLOSE)
     delta = Float32.(dataset.delta)
     gamma = Float32.(dataset.gamma)
@@ -48,41 +63,32 @@ function preprocess_data(dataset, train_ratio=0.8)
     midpoint = Float32.((bid + ask) ./ 2)
     T = Float32.(Dates.value.(dataset.expiration .- dataset.date)) ./ 365.0
 
-    # Normalize function with clipping for stability
-    function normalize(data, mean_val, std_val; clip_min=-3.0, clip_max=3.0)
-        normalized = (data .- mean_val) ./ std_val
-        return clamp.(normalized, clip_min, clip_max)
+    # Normalize features column by column
+    feature_columns = [
+        CLOSE, delta, gamma, theta, vega, rho, T, strike_normalized, midpoint, call_put_binary
+    ]
+    normalization_methods = ["zscore", "zscore", "minmax", "minmax", "zscore", "zscore", "zscore", "zscore", "zscore", "zscore"]
+
+    normalized_features = []
+    normalization_params = []
+
+    for (col, method) in zip(feature_columns, normalization_methods)
+        result = normalize_column(col, method)
+        normalized_col = result[1]  # The normalized data
+        params = result[2:end]      # The additional parameters
+        push!(normalized_features, normalized_col)
+        push!(normalization_params, params)
     end
 
-    # Compute normalization statistics for individual features into a 2d array
-    features = hcat(
-        CLOSE,
-        delta,
-        gamma,
-        theta,
-        vega,
-        rho,
-        T,
-        strike_normalized,
-        midpoint,
-        call_put_binary
-    )
-
-    # Compute mean and standard deviation
-    feature_mean = mean(features, dims=1)
-    feature_std = std(features, dims=1)
-
-    # Normalize features
-    normalized_features = (features .- feature_mean) ./ feature_std
-    normalized_features = clamp.(normalized_features, -3.0f0, 3.0f0)  # Apply clipping
+    features = hcat(normalized_features...)
 
     # Split into train and test sets
     num_train = Int(size(dataset, 1) * train_ratio)
-    x_train = normalized_features[1:num_train, :]
-    y_train = normalized_features[1:num_train, 1:2]  # Target is CLOSE and delta
+    x_train = features[1:num_train, :]
+    y_train = features[1:num_train, 1:2]  # Target is CLOSE and delta
 
-    x_test = normalized_features[num_train+1:end, :]
-    y_test = normalized_features[num_train+1:end, 1:2]
+    x_test = features[num_train+1:end, :]
+    y_test = features[num_train+1:end, 1:2]
     
     # Convert to Float32 for consistency
     x_train = Float32.(x_train)
@@ -93,10 +99,10 @@ function preprocess_data(dataset, train_ratio=0.8)
     log("x_train stats: mean = $(mean(x_train, dims=1)), std = $(std(x_train, dims=1))")
     log("y_train stats: mean = $(mean(y_train, dims=1)), std = $(std(y_train, dims=1))")
 
-    return x_train, y_train, x_test, y_test, feature_mean, feature_std
+    return x_train, y_train, x_test, y_test, normalization_params
 end
 
-x_train, y_train, x_test, y_test, feature_mean, feature_std = preprocess_data(dataset)
+x_train, y_train, x_test, y_test, normalization_params = preprocess_data(dataset)
 log("Initial feature matrix size: $(size(x_train))")
 log("Initial target matrix size: $(size(y_train))")
 
@@ -189,115 +195,36 @@ batch_size = 128
 epochs = 10
 lr = 0.01f0
 θ_vec = xavier_initialization(drift_layers, diffusion_layers)
+
 # Adjust loss weights dynamically based on magnitude
 function batch_loss(x_batch, y_batch, θ, batch_idx)
     S_pred, V_pred = forward_batch(x_batch, θ)
     mse_S = mean((S_pred .- y_batch[:, 1]).^2)
     mse_V = mean((V_pred .- y_batch[:, 2]).^2)
-
     weight_S = 1.0f0 / (1.0f0 + mse_S)
     weight_V = 1.0f0 / (1.0f0 + mse_V)
-
-    # Weighted loss
-    loss = weight_S * mse_S + weight_V * mse_V
-
-    # Debugging
-    # if batch_idx % 50 == 0
-    #     log("Debugging Batch $batch_idx:")
-    #     log("mse_S: $mse_S, mse_V: $mse_V, weight_S: $weight_S, weight_V: $weight_V")
-    #     log("S_pred (first 5): $(S_pred[1:5])")
-    #     log("V_pred (first 5): $(V_pred[1:5])")
-    # end
-
-    return loss
+    return weight_S * mse_S + weight_V * mse_V
 end
 
-# Training with batch processing
-function train_model_batch_with_logging(x_train, y_train, x_test, y_test, θ_vec, epochs, batch_size, lr)
-    log("Starting batch training...")
-    num_samples = size(x_train, 1)
-    num_batches = div(num_samples, batch_size)
-
-    # Initialize loss history
-    train_loss_history = []
-    val_loss_history = []
+# Training Loop
+function train_model(x_train, y_train, x_test, y_test, θ_vec, epochs, batch_size, lr)
+    log("Starting training...")
+    train_loss_history, val_loss_history = [], []
 
     for epoch in 1:epochs
         log("Epoch $epoch...")
-        epoch_loss = 0.0f0  # To accumulate loss for the epoch
-
-        for batch_idx in 0:(num_batches-1)
+        epoch_loss = 0.0f0
+        for batch_idx in 0:(size(x_train, 1) ÷ batch_size - 1)
             start_idx = batch_idx * batch_size + 1
-            end_idx = min((batch_idx + 1) * batch_size, num_samples)
-            x_batch = x_train[start_idx:end_idx, :]
-            y_batch = y_train[start_idx:end_idx, :]
-
-            # Compute loss and gradient for this batch
-            function compute_loss(θ)
-                return batch_loss(x_batch, y_batch, θ, batch_idx) + 1e-4 * sum(θ.^2)
-            end
-
-            loss_value, pullback_fn = Zygote.pullback(compute_loss, θ_vec)  # Get the loss and pullback
-            grad = pullback_fn(1)[1]  # Compute gradients
-            epoch_loss += loss_value  # Accumulate batch loss
-
-            # Apply gradient clipping during parameter updates
-            clipped_grad = clamp.(grad, -10.0f0, 10.0f0)
-            θ_vec .= θ_vec .- lr .* clipped_grad
-
-            if any(isnan.(θ_vec)) || any(isinf.(θ_vec))
-                error("θ_vec contains NaN or Inf values!")
-            end
-
-            # Log batch loss
-            log("Batch $batch_idx: Loss = $loss_value")
+            end_idx = min(start_idx + batch_size - 1, size(x_train, 1))
+            x_batch, y_batch = x_train[start_idx:end_idx, :], y_train[start_idx:end_idx, :]
+            function loss(θ) return batch_loss(x_batch, y_batch, θ, batch_idx) end
+            grad = gradient(loss, θ_vec)
+            θ_vec .-= lr .* grad[1]
         end
-
-        # Compute average loss for the epoch
-        avg_epoch_loss = epoch_loss / num_batches
-        push!(train_loss_history, avg_epoch_loss)
-        log("Epoch $epoch completed. Average Training Loss: $avg_epoch_loss")
-
-        # Calculate validation loss
-        val_loss = calculate_validation_loss(x_test, y_test, θ_vec)
-        push!(val_loss_history, val_loss)
-        log("Epoch $epoch Validation Loss: $val_loss")
+        push!(train_loss_history, epoch_loss / size(x_train, 1))
+        log("Epoch $epoch completed with Loss = $(train_loss_history[end])")
     end
-
-    # Save model parameters explicitly
-    log("Saving model to: $(pwd())/neural_sde_model.bson")
-    log("Saving θ_vec with size: $(length(θ_vec))")
-    BSON.@save "neural_sde_model.bson" θ_vec=θ_vec train_loss_history=train_loss_history val_loss_history=val_loss_history
-    log("Model saved successfully.")
-
-    return train_loss_history, val_loss_history
 end
 
-function calculate_validation_loss(x_test, y_test, θ)
-    val_samples = size(x_test, 1)
-    val_loss = 0.0f0
-
-    for i in 1:val_samples
-        x_sample = reshape(x_test[i, :], 1, :)  # Reshape to 2D array
-        y_sample = y_test[i, :]
-        function compute_loss(θ)
-            S_pred, V_pred = forward_batch(x_sample, θ)
-            mse_S = mean((S_pred .- y_sample[1]).^2)
-            mse_V = mean((V_pred .- y_sample[2]).^2)
-            return mse_S + mse_V
-        end
-        val_loss += compute_loss(θ)
-    end
-
-    return val_loss / val_samples
-end
-
-# Train the model and collect loss history
-train_loss_history, val_loss_history = train_model_batch_with_logging(
-    x_train, y_train, x_test, y_test, θ_vec, epochs, batch_size, lr
-)
-
-# Plot training and validation losses
-log("Plotting loss history...")
-plot(1:epochs, train_loss_history, label="Training Loss", xlabel="Epoch", ylabel="Loss", title="Loss History")
-plot!(1:epochs, val_loss_history, label="Validation Loss", xlabel="Epoch", ylabel="Loss", title="Loss History")
+train_model(x_train, y_train, x_test, y_test, θ_vec, epochs, batch_size, lr)

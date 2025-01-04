@@ -3,9 +3,9 @@ using DataFrames
 using Dates
 
 # File paths
-options_file = "post-no-preference_options_master_option_chain.csv"
-stock_file = "A.csv"
-output_file = "options-A-merged.csv"
+options_file = "data/post-no-preference_options_master_option_chain.csv"
+stock_file = "data/A.csv"
+output_file = "data/options-A-merged.csv"
 
 # Load the CSV files into DataFrames
 options_data = CSV.read(options_file, DataFrame)

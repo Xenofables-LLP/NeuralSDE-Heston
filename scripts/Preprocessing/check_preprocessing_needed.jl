@@ -2,7 +2,7 @@ using CSV
 using DataFrames
 
 # Path to the option chain CSV file
-option_chain_file = "merged_options_with_stock_close.csv"
+option_chain_file = "data/merged_options_with_stock_close.csv"
 
 try
     # Load the CSV file into a DataFrame

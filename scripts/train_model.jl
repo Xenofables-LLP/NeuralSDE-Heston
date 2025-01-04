@@ -19,7 +19,7 @@ end
 log("Starting Functional Neural SDE with Zygote...")
 
 # Load and Preprocess Dataset
-file_path = "options-A-merged.csv"
+file_path = "data/options-A-merged.csv"
 log("Loading dataset from '$file_path'...")
 dataset = CSV.File(file_path, header=true) |> DataFrame
 log("Dataset loaded successfully!")
